@@ -1,0 +1,564 @@
+---
+title: "Baseline_using Tinas_System"
+author: "Data Science and Systems"
+date: "2/12/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(DBI)
+library(tidyverse)
+library(dbplyr)
+library(dplyr)
+library(odbc)
+library(ggplot2)
+library(scales)
+library(kableExtra)
+library(Hmisc)
+library(plotly)
+library(IDPmisc)
+library(data.table)
+source("~/env_vars.R")
+source("~/keywords.R")
+source("~/clean_addr_source.R")
+
+.datatable.aware <- TRUE
+
+```
+
+Here we set up the connection and extract some data
+
+```{r Connection}
+sqdw_con <- dbConnect(
+  odbc::odbc(),
+  Driver = "msodbcsql18",
+  Server = Sys.getenv("SQDW_SERVER"),
+  Database = Sys.getenv("SQDW_DB"),
+  UID = Sys.getenv("SQDW_USER"),
+  PWD = Sys.getenv("SQDW_PASS"),
+  TrustServerCertificate="YES",
+  timeout = 10
+)
+
+dw_person <- dbGetQuery(sqdw_con,paste("SELECT top 100000 * FROM Fact.VW_Person WITH (NOLOCK) where PER_StreetAddress is not NULL"))
+
+dw_person$ID <- seq.int(nrow(dw_person))
+
+#kable(dw_person) %>%
+# kable_styling() %>%
+ #   scroll_box(width = "800px", height = "300px")
+                    
+```
+
+Now we standardize and clean the data
+
+
+```{r}
+
+setDT(dw_person)
+
+start_time <- Sys.time()
+incoming_geo3 <- clean_addr_source(df=dw_person, addr_var="PER_StreetAddress", city_var="PER_City", state_var="PER_State", zip_var="PER_Zip")
+message("Time to clean addresses: ", as.numeric(difftime(Sys.time(), start_time, units = "secs"))) 
+
+#write.csv(incoming_geo3, "cleaned100k_data.csv", row.names=FALSE, quote=FALSE)
+
+write.table(incoming_geo3,file="cleaned100k_data1.csv",sep="|")
+
+
+
+
+head(incoming_geo3)
+```
+
+Now its time for matching
+
+```{r}
+# Separate based on county name, then health district
+#incoming_lac_temp1 <- incoming_geo3[str_trim(county_ca) %like% "Los Angeles"]
+#nrow(incoming_lac_temp1)
+#incoming_lac_temp2 <- incoming_lac_temp1[!(str_trim(HD_NAME) %in% c("Pasadena", "Long Beach"))]
+#nrow(incoming_lac_temp2)
+
+# get OOO records
+#incoming_ooo_temp1 <- incoming_geo3[!incoming_geo3[incoming_lac_temp2, on = "record_id", nomatch = 0L], on = "record_id"]
+#nrow(incoming_ooo_temp1)+nrow(incoming_lac_temp2)==nrow(incoming_geo3)
+
+# Identify additional non LAC addresses using zip code and city names
+#source("non_lac.R")
+ 
+#ooo_outputs <- non_lac(df=incoming_lac_temp2, zip_var="address_zip", city_var="address_city", id_var="ID")
+#incoming_ooo_temp2 <- ooo_outputs[[1]]
+#incoming_lac_temp3 <- ooo_outputs[[2]]
+#nrow(incoming_ooo_temp2)+nrow(incoming_lac_temp3)==nrow(incoming_lac_temp2)
+
+# combine
+#incoming_ooo <- rbind(incoming_ooo_temp1, incoming_ooo_temp2)
+#incoming_lac <- unique(rbind(incoming_lac_temp2, incoming_lac_temp3), by="record_id")
+#message("Total OOO:", nrow(incoming_ooo))
+#message("Total LAC:", nrow(incoming_lac))
+
+#rm(incoming_geo, incoming_geo2, incoming_geo3, incoming_lac_temp1, incoming_lac_temp2, #incoming_lac_temp3, incoming_ooo_temp1, incoming_ooo_temp2, ooo_outputs)
+
+#saveRDS(incoming_lac, paste0("incoming_geo_", test_num, ".RDS"))
+```
+
+# Create Blocks
+
+## DW Primary Person Data
+```{r}
+
+source("createblocks.R")
+
+start_time <- Sys.time()
+per_block1 <- create_blocks(df=incoming_geo3, id_var="ID", fname_var="PER_FirstName", lname_var="PER_LastName", dob_var="PER_DOB",phn1_var="PER_HomePhone", phn2_var="PER_CellularPhoneOrPager", email_var="PER_Email", addr_var="PER_StreetAddress")
+
+per_block1[, `:=` (original_address = str_squish(gsub("[^[:alnum:][:space:],]", " ", toupper(PER_StreetAddress))),
+                   addr_valid = str_squish(gsub("[^[:alnum:][:space:],]", " ", toupper(PER_StreetAddress))),
+                   congregate_setting = as.numeric(NA), disease = "PERSON")]
+
+# per_block1 <- per_block1[, c("pname", "first_name_1", "last_name_1", "addr_valid", "addr4", "phn1", "phn2", "email", "dob", "fname4", "lname4", "id",
+#                              "original_address", "initials", "initials_flipped", "first_name", "last_name", "mrn", "congregate_setting", "disease", "pname_org")]
+message("Time to process person data: ", as.numeric(difftime(Sys.time(), start_time, units = "mins")))
+message("Total persons: ", nrow(per_block1))
+# nrow(per_block1 %>% dplyr::group_by(id) %>% dplyr::tally() %>% dplyr::filter(n>1))
+```
+
+## Review Blocks
+
+```{r} 
+# View(per_block1 %>% dplyr::filter(first_name != "" & last_name != "") %>% dplyr::group_by(pname_org, pname, PER_FirstName, PER_LastName, first_name, last_name, first_name_1, last_name_1, fname4, lname4, initials, initials_flipped) %>% dplyr::tally())
+# View(per_block1 %>% dplyr::filter(first_name == "" | last_name == "") %>% dplyr::group_by(PER_FirstName, PER_LastName, first_name, last_name) %>% dplyr::tally())
+# View(per_block1 %>% dplyr::group_by(PER_MiddleName, mid_name) %>% dplyr::tally())
+# View(per_block1 %>% dplyr::group_by(PER_DOB, dob) %>% dplyr::tally())
+# View(per_block1 %>% dplyr::group_by(PER_StreetAddress, original_address, addr_valid, addr4) %>% dplyr::tally()) 
+```   
+
+## DW Incident Data dont need
+```{r} 
+#start_time <- Sys.time()
+#inc_block1 <- create_blocks(df=dw_inc_fnl, id_var="PR_IncidentID", fname_var="PER_FirstName", #lname_var="PER_LastName", dob_var="PER_DOB", mrn_var="PR_MedicalRecordNumber", #phn1_var="PER_HomePhone", phn2_var="PER_CellularPhoneOrPager", email_var="PER_Email", #addr_var="PER_StreetAddress")
+
+#inc_block1[, `:=` (original_address = str_squish(gsub("[^[:alnum:][:space:],]", " ", #toupper(PER_StreetAddress))),
+#                   addr_valid = str_squish(gsub("[^[:alnum:][:space:],]", " ", #toupper(PER_StreetAddress))),
+#                   congregate_setting = as.numeric(NA),
+#                   disease = str_squish(toupper(PR_Disease)))]
+#message("Time to process incident data: ", as.numeric(difftime(Sys.time(), start_time, units = "mins")))
+#message("Total incidents: ", nrow(inc_block1))
+# nrow(inc_block1 %>% dplyr::group_by(id) %>% dplyr::tally() %>% dplyr::filter(n>1))
+```   
+
+## Review Blocks
+
+```{r} 
+# View(inc_block1 %>% dplyr::filter(first_name != "" & last_name != "") %>% dplyr::group_by(pname_org, pname, PER_FirstName, PER_LastName, first_name, last_name, first_name_1, last_name_1, fname4, lname4, initials, initials_flipped) %>% dplyr::tally())
+# View(inc_block1 %>% dplyr::filter(first_name == "" | last_name == "") %>% dplyr::group_by(PER_FirstName, PER_LastName, first_name, last_name) %>% dplyr::tally())
+# View(inc_block1 %>% dplyr::group_by(PER_MiddleName, mid_name) %>% dplyr::tally()) 
+# View(inc_block1 %>% dplyr::group_by(PER_DOB, dob) %>% dplyr::tally()) 
+# View(inc_block1 %>% dplyr::group_by(PER_StreetAddress, original_address, addr_valid, addr4) %>% dplyr::tally()) 
+# View(vrbis_block %>% dplyr::filter(mrn == "" | is.na(mrn)) %>% dplyr::group_by(PR_MedicalRecordNumber, mrn) %>% dplyr::tally()) 
+# View(vrbis_block %>% dplyr::filter(mrn != "" & !is.na(mrn)) %>% dplyr::group_by(PR_MedicalRecordNumber, mrn) %>% dplyr::tally()) 
+```  
+
+# Flag common names/emails/phone numbers and rare names
+
+```{r}
+start_time <- Sys.time()
+knitr::knit(file.path("dw_rarenames.Rmd"), quiet = TRUE)
+message("Time to create flags: ", as.numeric(difftime(Sys.time(), start_time, units = "mins")))
+
+#rm(per_block1, inc_block1)
+```
+
+
+
+## Select cols to keep
+
+```{r} 
+match_cols <- c("pname", "first_name_1", "last_name_1", "addr_valid", "addr4", "phn1", "phn2", "email", "dob", "fname4", "lname4", "id",
+                "original_address", "initials", "initials_flipped", "first_name", "last_name", "congregate_setting", "disease", "common_name_flag",
+                "rare_name_flag", "common_email_flag", "common_phn_flag")
+
+per_block <- per_block[, ..match_cols]
+#inc_block <- inc_block[, ..match_cols]
+
+#saveRDS(inc_block, paste0("inc_block_", ".RDS"))
+saveRDS(per_block, paste0("per_block_", ".RDS"))
+
+#per_block <- readRDS( paste0("per_block_", test_num, ".RDS"))
+#inc_block <- readRDS(paste0("inc_block_", test_num, ".RDS"))
+# nrow(per_block %>% dplyr::group_by(id) %>% dplyr::tally() %>% dplyr::filter(n>1))
+# nrow(inc_block %>% dplyr::group_by(id) %>% dplyr::tally() %>% dplyr::filter(n>1)) 
+```
+
+## Web CMR Data
+```{r} 
+#start_time <- Sys.time()
+#incoming_block1 <- create_blocks(df=incoming_lac, id_var="record_id", #fname_var="patient_name_first", lname_var="patient_name_last", dob_var="dob", mrn_var="med_record_num", phn1_var="phone_home", phn2_var="phone_cell", email_var="email", addr_var="address_source2") 
+
+#incoming_block1[, `:=` (original_address = str_squish(gsub("[^[:alnum:][:space:],]", " ", #toupper(address_st))),
+                        # addr_valid = str_squish(gsub("[^[:alnum:][:space:],]", " ", toupper(address_source2))),
+#                        initials_flipped = initials,
+#                        disease = str_squish(toupper(disease)))]  
+#message("Time to process incident data: ", as.numeric(difftime(Sys.time(), start_time, units = "secs")))
+#message("Total incidents: ", nrow(incoming_block1))  
+# nrow(incoming_block1 %>% dplyr::group_by(id) %>% dplyr::tally() %>% dplyr::filter(n>1)) 
+
+#saveRDS(incoming_block1, file.path(data_path, paste0("incoming_block1_", test_num, ".RDS")))
+``` 
+
+# Flag congregate settings in Web CMR data
+
+```{r}  
+#start_time <- Sys.time()
+#knitr::knit(file.path("scripts/spatial_join.Rmd"), quiet = TRUE)    
+#message("Time to flag facilities: ", as.numeric(difftime(Sys.time(), start_time, units = "min")))   
+```
+ 
+# Incident Matching
+
+NOTE: ADD BLOCK ON LAST AND FIRST NAME SINCE ITS POSSIBLE THAT THESE COULD BE MISSING FIELDS
+
+```{r} 
+#source(file.path(generic_dir, "DT/dob_rules.R"))
+#source(file.path(generic_dir, "namematches.R"))
+#source("scripts/match_passes.R")
+
+# Match Passes
+#start_time <- Sys.time()
+#all_matches_inc <- match_passes(system_df=inc_block, external_df=incoming_block, type="Incident")[, c("common_name_flag.1", "rare_name_flag.1", "common_email_flag.1", "common_phn_flag.1") := NULL] 
+#setnames(all_matches_inc, 
+#         old = c("common_name_flag.2", "rare_name_flag.2", "common_email_flag.2", "common_phn_flag.2"), 
+ #        new = c("common_name_flag", "rare_name_flag", "common_email_flag", "common_phn_flag"))
+#message("Time to match: ", as.numeric(difftime(Sys.time(), start_time, units = "mins")))  
+
+# Create Flags
+#source(file.path("scripts", "create_flags.R")) 
+#start_time <- Sys.time()
+#all_matches_inc <- create_flags(df=all_matches_inc)
+#message("Time to create flags: ", as.numeric(difftime(Sys.time(), start_time, units = "mins"))) 
+
+# all_matches_inc %>% dplyr::filter(is.na(match_sum)) %>% dplyr::group_by(match_sum, addr_match, email_match, phone_match, mrn_match) %>% dplyr::tally()
+# all_matches_inc %>% dplyr::filter(match_sum == 0) %>% dplyr::group_by(match_sum, addr_match, email_match, phone_match, mrn_match) %>% dplyr::tally()
+# all_matches_inc %>% dplyr::filter(match_sum == 1) %>% dplyr::group_by(match_sum, addr_match, email_match, phone_match, mrn_match) %>% dplyr::tally()
+# all_matches_inc %>% dplyr::filter(match_sum == 2) %>% dplyr::group_by(match_sum, addr_match, email_match, phone_match, mrn_match) %>% dplyr::tally()
+# all_matches_inc %>% dplyr::filter(match_sum == 3) %>% dplyr::group_by(match_sum, addr_match, email_match, phone_match, mrn_match) %>% dplyr::tally()
+# all_matches_inc %>% dplyr::filter(match_sum > 3) %>% dplyr::group_by(match_sum, addr_match, email_match, phone_match, mrn_match) %>% dplyr::tally()
+
+# Determine whether matches are true/false
+#source(file.path("scripts", "match_rules.R")) 
+#start_time <- Sys.time()
+#outlist <- match_rules(all_matches=all_matches_inc, external_df=incoming_block)
+#message("Time to apply match rules: ", as.numeric(difftime(Sys.time(), start_time, units = "secs")))
+
+# Separate results into data frames
+#truematches_inc <- outlist[[1]][, `:=`(match = "Incident")] 
+#falsematches_inc <- outlist[[2]]  
+#nonmatches_inc <- outlist[[3]] 
+
+# Set keys for merge 
+#setnames(incoming_block, "id.1", "id")
+#setkey(nonmatches_inc, id)
+#setkey(incoming_block, id)
+
+# Inner join data tables
+#start_time <- Sys.time()   
+#nonmatches_inc <- merge(nonmatches_inc, incoming_block, on = "id")[, ..match_cols] 
+#message("Time to merge Incidents and Persons: ", as.numeric(difftime(Sys.time(), start_time, units = "secs")))  
+#message("Total Incidents for Match: ", nrow(dw_inc_fnl))  
+
+# Remove key
+#setkey(nonmatches_inc, NULL)
+# setkey(incoming_block, NULL) 
+
+#message("Total True Incident Matches: ", nrow(truematches_inc)) 
+#message("Total False Incident Matches: ", length(unique(falsematches_inc[, id.1]))) 
+#message("Total Incident Non-Matches: ", length(unique(nonmatches_inc[, id])))   
+```
+
+# Person Matching
+
+```{r}    
+# Match Passes
+start_time <- Sys.time()
+all_matches_per <- match_passes(system_df=per_block, external_df=nonmatches_inc, type="Person")[, c("common_name_flag.1", "rare_name_flag.1", "common_email_flag.1", "common_phn_flag.1") := NULL]   
+setnames(all_matches_per, 
+         old = c("common_name_flag.2", "rare_name_flag.2", "common_email_flag.2", "common_phn_flag.2"), 
+         new = c("common_name_flag", "rare_name_flag", "common_email_flag", "common_phn_flag"))
+message("Time to match: ", as.numeric(difftime(Sys.time(), start_time, units = "mins")))  
+ 
+# Create Flags 
+start_time <- Sys.time()
+all_matches_per <- create_flags(df=all_matches_per)
+message("Time to create flags: ", as.numeric(difftime(Sys.time(), start_time, units = "mins")))  
+
+# all_matches_per %>% dplyr::filter(is.na(match_sum)) %>% dplyr::group_by(match_sum, addr_match, email_match, phone_match, mrn_match) %>% dplyr::tally()
+# all_matches_per %>% dplyr::filter(match_sum == 0) %>% dplyr::group_by(match_sum, addr_match, email_match, phone_match, mrn_match) %>% dplyr::tally()
+# all_matches_per %>% dplyr::filter(match_sum == 1) %>% dplyr::group_by(match_sum, addr_match, email_match, phone_match, mrn_match) %>% dplyr::tally()
+# all_matches_per %>% dplyr::filter(match_sum == 2) %>% dplyr::group_by(match_sum, addr_match, email_match, phone_match, mrn_match) %>% dplyr::tally()
+# all_matches_per %>% dplyr::filter(match_sum == 3) %>% dplyr::group_by(match_sum, addr_match, email_match, phone_match, mrn_match) %>% dplyr::tally()
+# all_matches_per %>% dplyr::filter(match_sum > 3) %>% dplyr::group_by(match_sum, addr_match, email_match, phone_match, mrn_match) %>% dplyr::tally()
+
+# Determine whether matches are true/false 
+# setnames(nonmatches_inc, "row_id", "row_id.1")
+start_time <- Sys.time()
+outlist <- match_rules(all_matches=all_matches_per, external_df=nonmatches_inc)
+message("Time to run match rules: ", as.numeric(difftime(Sys.time(), start_time, units = "secs"))) 
+
+# Separate results into data frames
+truematches_per <- outlist[[1]][, `:=`(match = "Person")] 
+falsematches_per <- outlist[[2]]  
+nonmatches_per <- outlist[[3]]
+
+# Set keys for merge 
+setkey(nonmatches_per, id) 
+
+# Inner join data tables
+start_time <- Sys.time() 
+nonmatches_per <- merge(nonmatches_per, incoming_block, on = "id")[, ..match_cols]  
+message("Time to merge: ", as.numeric(difftime(Sys.time(), start_time, units = "secs")))   
+
+# Remove key
+setkey(nonmatches_per, NULL)
+setkey(incoming_block, NULL)  
+
+message("Total True Person Matches: ", nrow(truematches_per)) 
+message("Total False Person Matches: ", length(unique(falsematches_per[, id.1]))) 
+message("Total Person Non-Matches: ", length(unique(nonmatches_per[, id])))    
+```
+
+# Process Incident Matches (merge in original system and external data)
+#```{r}   
+#cols_to_select <- c("combined_id", "PER_RowID", "PER_ClientID", "PR_IncidentID", #"PR_IncidentID_cmr", "PER_RowID_cmr", "PER_ClientID_cmr", "disease.1", "PR_DateCreated", #"max_PR_DateCreated", "PR_ResolutionStatus", "PR_ProcessStatus", "PR_EpisodeDate", #"PR_EpisodeDate_cmr", "match_sum", "dob_match", "dob_restrict", "common_name_flag", #"rare_name_flag", "common_email_flag", "common_phn_flag", "peh", "congregate_setting.1", #"name_score", "name_flip", "fname_score", "lname_score", "fname_detect", "lname_detect", #"pname.1", "pname.2", "PER_FirstName_cmr", "PER_LastName_cmr", "PER_FirstName", "PER_LastName", #"dob.1", "dob.2", "PER_DOB_cmr", "PER_DOB", "addr_score", "addr4_score", "addr_detect", #"addr_valid.1", "addr_valid.2", "PER_StreetAddress_cmr", "PER_StreetAddress", "phone_match", #"phn1.1", "phn2.1",  "phn1.2", "phn2.2", "PER_HomePhone_cmr", "PER_CellularPhoneOrPager_cmr", #"PER_HomePhone", "PER_CellularPhoneOrPager", "email_score", "email.1", "email.2", "PER_Email_cmr", #"PER_Email", "mrn_match", "mrn.1", "mrn.2", "PR_MedicalRecordNumber_cmr", #"PR_MedicalRecordNumber", "match_type", "matched", "match", "priority")
+
+#truematches_inc2 <- truematches_inc[, matched := 1][, PR_IncidentID_cmr := as.character(id.1)][, #PR_IncidentID := as.character(id.2)] 
+
+# rename incoming web cmr variables
+#incoming_lac2 <- incoming_lac[, PR_IncidentID := as.character(PR_IncidentID)]
+#colnames(incoming_lac2)<-paste(colnames(incoming_lac2),"cmr",sep="_") 
+
+# inner join incoming web cmr and true matches
+#setkey(incoming_lac2, PR_IncidentID_cmr); setkey(truematches_inc2, PR_IncidentID_cmr) 
+#dw_inc_merged_temp <- merge(incoming_lac2, truematches_inc2)  
+#setkey(dw_inc_merged_temp, NULL)  
+
+# rename system variables
+#dw_inc_fnl2 <- dw_inc_fnl[, PR_IncidentID := as.character(PR_IncidentID)]
+
+# inner join system and true matches
+#setkey(dw_inc_fnl2, PR_IncidentID); setkey(dw_inc_merged_temp, PR_IncidentID)   
+#dw_inc_merged <- merge(dw_inc_merged_temp, dw_inc_fnl2)[, ..cols_to_select]    
+#setkey(dw_inc_merged, NULL)  
+
+# flag as true match if PER_ClientID are equal
+#dw_inc_merged[, truematch := ifelse(PER_ClientID_cmr == PER_ClientID, 1, 0)]
+#table(dw_inc_merged$truematch)
+
+# nrow(dw_inc_merged %>% dplyr::group_by(PR_IncidentID) %>% dplyr::tally() %>% dplyr::filter(n>1))
+# nrow(dw_inc_merged %>% dplyr::group_by(PR_IncidentID_cmr) %>% dplyr::tally() %>% dplyr::filter(n>1)) 
+``` 
+ 
+# Deduplicate to keep 1 Incoming Incident per System Incident 
+
+```{r}    
+# Total # of system incidents each CMR incident matched to
+#dw_inc_merged[, cmr_match_cnt := .N, by = PR_IncidentID_cmr]
+#nrow(dw_inc_merged %>% dplyr::filter(cmr_match_cnt>1))
+#min(dw_inc_merged$cmr_match_cnt) 
+
+# Apply Reinfection Criteria (within 90 days) 
+# For IRIS, cascade Episode Date then Create Date
+# For Web CMR, cascade Specimen Collection Date, Onset Date, Report Date
+#dw_inc_merged[, eps_diff := ifelse(!is.na(as.Date(PR_EpisodeDate)), 
+#                                   abs(as.numeric(difftime(as.Date(PR_EpisodeDate), #as.Date(PR_EpisodeDate_cmr), units = "days"))), 0)]
+
+
+#dw_inc_merged[, eps_diff := abs(as.numeric(difftime(as.Date(PR_EpisodeDate), #as.Date(PR_EpisodeDate_cmr), units = "days")))]
+#dw_inc_merged[, within90 := ifelse(eps_diff <= 90, 1, 0)]
+#table(dw_inc_merged$within90) 
+
+# If 1 Web CMR Incident only matched to 1 System Incident, assign routing based on Reinfection Period
+#dw_inc_merged[, routing := ifelse(cmr_match_cnt == 1 & within90 == 1, "attach incident", 
+#                                  ifelse(cmr_match_cnt == 1 & within90 == 0, "create incident", #""))]
+#table(dw_inc_merged$routing)  
+#nrow(dw_inc_merged %>% 
+#       dplyr::filter(cmr_match_cnt == 1 & is.na(routing)) %>% 
+#       dplyr::select(routing, PR_IncidentID_cmr, PR_IncidentID, PR_ResolutionStatus, #cmr_match_cnt, within90, PR_EpisodeDate, PR_EpisodeDate_cmr, eps_diff, PR_DateCreated))
+
+#test <- dw_inc_merged %>% 
+#  dplyr::filter(cmr_match_cnt == 1 & is.na(routing)) %>%
+#  dplyr::select(PR_IncidentID, PR_ResolutionStatus, PR_EpisodeDate, PR_DateCreated)
+#nrow(test)
+#write.csv(test, file.path(output_path, "missing_episodes_inIRIS.csv"), row.names = FALSE, na = "")
+
+#View(dw_inc_merged %>% dplyr::select(PR_EpisodeDate, PR_EpisodeDate_cmr, eps_diff))
+# # If one Web CMR Incident matches to > 1 DW Incident, keep the match with the most recent create #date in DW  
+# dw_inc_merged <- dw_inc_merged[, match_to_keep := ifelse((cmr_match_cnt > 1 & PR_DateCreated == max_PR_DateCreated) | cmr_match_cnt == 1, 1, 0)] 
+# table(dw_inc_merged$match_to_keep) 
+
+# dw_inc_merged <- dw_inc_merged[match_to_keep == 1] 
+
+# for HEP B AND C we might want to only match on person-level
+# for these diseases, they dont get anything attached since the carrier incidents dont get reviewed
+# meredith is going to confirm with MIRNA on what to do
+# and ask GUSTAVO if there are other diseases that need distinct handling 
+
+## apply the reinfection criteria first
+## then if there are multiple incidents within the reinfection period, 1) keep match to confirmed or 2) keep match to probable/suspect or 3) keep match to false
+## like 1
+
+#test <- dw_inc_merged[cmr_match_cnt>300]
+#test <- test[order(PR_IncidentID_cmr)]
+#test[, PR_DateCreated := format(PR_DateCreated, "%Y-%m-%d %H:%M:%S")]
+#test[, max_PR_DateCreated := format(max_PR_DateCreated, "%Y-%m-%d %H:%M:%S")]
+#write.csv(test, file.path(output_path, "CMRID_84084421.csv"), row.names = FALSE, na = "")
+
+# nrow(test)
+# View(dw_inc_merged %>% dplyr::filter(cmr_match_cnt>1) %>% dplyr::select(match_to_keep, all_of(cols_to_select)))
+# nrow(dw_inc_merged %>% dplyr::filter(cmr_match_cnt==1 & match_to_keep == 0) %>% dplyr::select(match_to_keep, all_of(cols_to_select)))
+
+
+
+
+# dw_inc_merged[, rownum := .I]
+# how many incoming incidents matched to multiple system?
+#View(dw_inc_merged %>% dplyr::group_by(PR_IncidentID_cmr) %>% dplyr::tally() %>% #dplyr::filter(n>1))
+#test <- dw_inc_merged %>% dplyr::filter(PR_IncidentID_cmr %in% c(84084421))
+#write.csv(test, file.path(output_path, "CMRID_84084421.csv"), row.names = FALSE, na = "")
+```
+
+# Process Person Matches
+
+```{r}  
+# merge CMR records that matched to Persons to CMR data to get row and client ID
+#truematches_per2 <- setnames(truematches_per, "row_id.1", "row_id")[, matched := 1]   
+#incoming_lac3 <- incoming_lac[, .(row_id, PER_RowID, PER_ClientID, PR_IncidentID)]
+
+#setkey(incoming_lac3, row_id)
+#setkey(truematches_per2, row_id) 
+
+# perform left join, create and select variables
+
+#cols_to_select <- c("row_id.2", "combined_id", "PER_RowID", "PER_ClientID", "match_sum", #"dob_match", "dob_restrict", "common_name_flag", "rare_name_flag", "common_email_flag", #"common_phn_flag", "peh", "congregate_setting.1", "name_score", "name_flip", "fname_score", #"lname_score", "fname_detect", "lname_detect", "pname.1", "pname.2", "dob.1", "dob.2", #"addr_score", "addr4_score", "addr_detect", "original_address.1", "original_address.2", #"addr_valid.1", "addr_valid.2", "phone_match", "phn1.1", "phn2.1", "phn1.2", "phn2.2", #"email_score", "email.1", "email.2", "mrn_match", "mrn.1", "mrn.2", "match_type", "matched", #"match", "priority", "disease.1")
+
+#incoming_lac3 <- merge(incoming_lac3, truematches_per2, by = "row_id", all.x = TRUE)[matched == #1][, row_id := NULL][, ..cols_to_select]  
+#setnames(incoming_lac3, old = c("row_id.2", "PER_RowID", "PER_ClientID"), new = c("row_id", #"PER_RowID_cmr", "PER_ClientID_cmr")) 
+#nrow(incoming_lac3)    
+
+# Merge in Incident data to get row and client id
+#per_fnl <- dw_primary[, .(row_id, PER_RowID, PER_ClientID)]
+
+# perform left join, filter and create new vars
+#setkey(per_fnl, row_id) 
+#per_fnl <- merge(per_fnl, incoming_lac3, by = "row_id", all.x = TRUE)[matched == 1][, `:=` #(truematch = ifelse(PER_ClientID_cmr == PER_ClientID, 1, 0),
+#                                                                                           row_id #= NULL, PER_RowID = NULL, PR_IncidentID = as.numeric(NA))]  
+#setkey(per_fnl, NULL)  
+#nrow(per_fnl)    
+
+#per_fnl_dt <- per_fnl 
+#saveRDS(per_fnl, file.path(output_path, paste0("per_fnl_", test_num, ".RDS")))
+
+# deduplicate to just keep 1 incident per matched person
+#per_fnl <- unique(per_fnl, by = c("PER_ClientID_cmr", "PER_ClientID"))
+#message("Deduplicate to just keep 1 incident per matched person: ", nrow(per_fnl))  
+#saveRDS(per_fnl, file.path(output_path, paste0("per_fnl_dedup_", test_num, ".RDS")))
+```
+
+
+# Combine Incident & Person Matches and Deduplicate
+
+```{r}  
+# Combine the two data.tables
+truematches_fnl <- rbind(inc_fnl, per_fnl)
+
+# Order the combined data.table
+truematches_fnl <- truematches_fnl[order(PER_ClientID_cmr, disease.1, -truematch)]
+
+# Group by PER_ClientID_cmr and disease.1 and select the first row in each group
+truematches_fnl <- truematches_fnl[, .SD[1], by = .(PER_ClientID_cmr, disease.1)]
+ 
+nrow(truematches_fnl) 
+table(truematches_fnl$match)      
+saveRDS(truematches_fnl, file.path(output_path, paste0("truematches_fnl_", test_num, ".RDS")))  
+```
+  
+# Output Match Validation Results
+
+```{r}   
+source(file.path("scripts", "match_validation.R"))
+output_results(filepath=output_path, incoming_df=incoming_lac, truematches_fnl=truematches_fnl, inc_fnl=inc_fnl, per_fnl=per_fnl)
+```
+ 
+# Output False Matches for Review
+
+```{r}   
+# Combine the two data.tables
+falsematches <- rbind(falsematches_inc, falsematches_per)[, .(passmatch, priority, match_type, match_sum, combined_id, common_name_flag, rare_name_flag, peh,
+                                                              name_score, fname_score, lname_score, fname_detect, lname_detect, name_flip, name_flip_score,
+                                                              pname.1, pname.2, dob_match, dob_restrict, dob.1, dob.2, addr_score, addr_detect, addr4_score,
+                                                              addr_valid.1, addr_valid.2, email_score, email.1, email.2, phone_match, phn1.1, phn2.1, phn1.2,
+                                                              phn1.2, mrn_match, mrn_match, mrn.1, mrn.2)] 
+ 
+nrow(falsematches)
+
+filename <- paste0("falsematches_", test_num, "_", today, ".csv")
+write.csv(falsematches, file.path(output_path, filename), row.names = FALSE, na = "")
+```
+  
+# Output R files 
+! TODO: We can keep these outputs
+
+Also need to include output to keep track of what happened
+
+```{r}   
+saveRDS(inc_fnl, file.path(data_path, paste0("inc_fnl_", test_num, "_", today, ".RDS")))
+saveRDS(per_fnl, file.path(data_path, paste0("per_fnl_", test_num, "_", today, ".RDS")))
+saveRDS(truematches_fnl, file.path(data_path, paste0("truematches_fnl_", test_num, "_", today, ".RDS")))
+```
+
+# Output for Bot
+
+```{r}
+web_cmr <- setDT(read.csv(file.path(output_path, "api_test.csv")))
+web_cmr_fnl <- rbind(web_cmr, web_cmr, web_cmr, web_cmr, web_cmr)[, row_number := .I]
+nrow(web_cmr_fnl) 
+
+inc_fnl2 <- inc_fnl[, row_number := .I][, .(PR_IncidentID, PER_ClientID, row_number)] 
+
+setkey(web_cmr_fnl, row_number); setkey(inc_fnl2, row_number)
+inc_for_bot <- merge(web_cmr_fnl, inc_fnl2)
+
+nrow(inc_for_bot) 
+
+setnames(inc_for_bot, "PER_ClientID", "Person_ID")
+setnames(inc_for_bot, "PR_IncidentID", "Incident_ID") 
+
+inc_for_bot[,record_id:=NULL]
+setnames(inc_for_bot, "row_number", "record_id")
+
+head(inc_for_bot)
+
+# per_for_bot <- per_fnl %>% slice(1:100) %>%
+#   select(PR_IncidentID, PER_ClientID) %>%
+#   mutate(web_cmr = row_number()+6) %>%
+#   left_join(incoming_df_loaded, by = "row_id") %>%
+#   rename(Person_ID = PER_ClientID,
+#          Incident_ID = PR_IncidentID)
+# 
+# non_for_bot <- webcmr %>% filter(record_id > 1000) %>%
+#   mutate(Person_ID=as.numeric(NA),
+#          Incident_ID=as.numeric(NA))
+
+
+filename <- paste0("inc_for_bot_", test_num, "_", today, ".csv")
+write.csv(inc_for_bot, file.path(output_path, filename), row.names = FALSE, na = "")
+
+# filename <- paste0("per_for_bot_", test_num, "_", today, ".csv")
+# write.csv(per_for_bot, file.path(output_path, filename), row.names = FALSE, na = "")
+# 
+# filename <- paste0("non_for_bot_", test_num, "_", today, ".csv")
+# write.csv(non_for_bot, file.path(output_path, filename), row.names = FALSE, na = "")
+```
+
+# Master Data Set
